@@ -93,8 +93,8 @@
         (sql/handle-additional-options details, :seperator-style :semicolon)))
 
 (defn- can-connect? [details]
-          (let [connection (connection-details->spec (ssh/include-ssh-tunnel details))]
-            (= 1M (first (vals (first (jdbc/query connection ["SELECT 1 FROM DUMMY"])))))))
+  (let [connection (connection-details->spec (ssh/include-ssh-tunnel details))]
+    (= 1 (first (vals (first (jdbc/query connection ["SELECT 1 FROM DUMMY"])))))))
 
 (defn- date-format [format-str expr] (hsql/call :to_char expr (hx/literal format-str)))
 (defn- str-to-date [format-str expr] (hsql/call :to_date expr (hx/literal format-str)))
@@ -185,7 +185,8 @@
   driver/IDriver
   (merge
    (sql/IDriverSQLDefaultsMixin)
-   {:date-interval                     (u/drop-first-arg date-interval)
+   {:can-connect?                      (u/drop-first-arg can-connect?)
+    :date-interval                     (u/drop-first-arg date-interval)
     :details-fields                    (constantly (ssh/with-tunnel-config
                                                      [driver/default-host-details
                                                       (assoc driver/default-port-details :default 30015)
