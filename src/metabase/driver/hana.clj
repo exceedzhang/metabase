@@ -8,6 +8,7 @@
              [set :as set]
              [string :as str]]
             [honeysql.core :as hsql]
+            [clojure.java.jdbc :as jdbc]
             [metabase
              [driver :as driver]
              [util :as u]]
@@ -57,32 +58,43 @@
     :VARCHAR    :type/Text} (keyword (str/replace (name column-type) #"\sUNSIGNED$" "")))) ; strip off " UNSIGNED" from end if present
 
 (def ^:private ^:const default-connection-args
-  "Map of args for the MySQL JDBC connection string.
-   Full list of is options is available here: http://dev.mysql.com/doc/connector-j/6.0/en/connector-j-reference-configuration-properties.html"
-  {;; 0000-00-00 dates are valid in MySQL; convert these to `null` when they come back because they're illegal in Java
+  "Map of args for the Hana JDBC connection string."
+  {;; 0000-00-00 dates are valid in Hana; convert these to `null` when they come back because they're illegal in Java
    :emptyTimestampIsNull          :true})
 
 (def ^:private ^:const ^String default-connection-args-string
   (str/join \& (for [[k v] default-connection-args]
                  (str (name k) \= (name v)))))
 
-(defn- append-connection-args
-  "Append `default-connection-args-string` to the connection string in CONNECTION-DETAILS, and an additional option to
-  explicitly disable SSL if appropriate. (Newer versions of MySQL will complain if you don't explicitly disable SSL.)"
-  {:argslist '([connection-spec details])}
-  [connection-spec {ssl? :ssl}]
-  (update connection-spec :subname
-          (fn [subname]
-            (let [join-char (if (str/includes? subname "?") "&" "?")]
-              (str subname join-char default-connection-args-string (when-not ssl?
-                                                                      "&useSSL=false"))))))
+(defn- connection-details->spec
+  "Build the connection spec for a SQL Server database from the DETAILS set in the admin panel.
+  Check out the full list of options here: `https://technet.microsoft.com/en-us/library/ms378988(v=sql.105).aspx`"
+  [{:keys [user password db host port ssl]
+    :or   {user "dbuser", password "dbpassword", db "", host "localhost", port "39017"}
+    :as   details}]
+  (-> { :classname       "com.sap.cloud.db.jdbc.Driver"
+        :subprotocol     "sap"
+        ;; it looks like the only thing that actually needs to be passed as the `subname` is the host; everything else
+        ;; can be passed as part of the Properties
+        :subname         (str "//" host ":" port)
+        ;; everything else gets passed as `java.util.Properties` to the JDBC connection.  (passing these as Properties
+        ;; instead of part of the `:subname` is preferable because they support things like passwords with special
+        ;; characters)
+        :host            host
+        :port            port
+        :password        password
+        :databaseName    db
+        ;; Wait up to 10 seconds for connection success. If we get no response by then, consider the connection failed
+        :user            user
+        :encrypt         (boolean ssl)}
+        ;; only include `port` if it is specified; leave out for dynamic port: see
+        ;; https://github.com/metabase/metabase/issues/7597
+        ;; (merge (when port {:port port}))
+        (sql/handle-additional-options details, :seperator-style :semicolon)))
 
-(defn- connection-details->spec [details]
-  (-> details
-      (set/rename-keys {:dbname :db})
-      dbspec/mysql
-      (append-connection-args details)
-      (sql/handle-additional-options details)))
+(defn- can-connect? [details]
+          (let [connection (connection-details->spec (ssh/include-ssh-tunnel details))]
+            (= 1M (first (vals (first (jdbc/query connection ["SELECT 1 FROM DUMMY"])))))))
 
 (defn- date-format [format-str expr] (hsql/call :to_char expr (hx/literal format-str)))
 (defn- str-to-date [format-str expr] (hsql/call :to_date expr (hx/literal format-str)))
@@ -91,9 +103,6 @@
   [_ time-value]
   (hx/->time time-value))
 
-;; Since MySQL doesn't have date_trunc() we fake it by formatting a date to an appropriate string and then converting
-;; back to a date. See http://dev.mysql.com/doc/refman/5.6/en/date-and-time-functions.html#function_date-format for an
-;; explanation of format specifiers
 (defn- trunc-with-format [format-str expr]
   (str-to-date format-str (date-format format-str expr)))
 
@@ -108,8 +117,6 @@
     :day-of-week     (hsql/call :dayofweek expr)
     :day-of-month    (hsql/call :dayofmonth expr)
     :day-of-year     (hsql/call :dayofyear expr)
-    ;; To convert a YEARWEEK (e.g. 201530) back to a date you need tell MySQL which day of the week to use,
-    ;; because otherwise as far as MySQL is concerned you could be talking about any of the days in that week
     :week            (hx/concat (hsql/call :week expr)
                                 (hsql/call :year expr))
     ;; mode 6: Sunday is first day of week, first week of year is the first one with 4+ days
@@ -198,12 +205,12 @@
     :connection-details->spec  (u/drop-first-arg connection-details->spec)
     :date                      (u/drop-first-arg date)
     :current-datetime-fn       (constantly now)
-    :excluded-schemas          (constantly #{"INFORMATION_SCHEMA"})
     ;; TODO
-    :quote-style               (constantly :mysql)
+    :excluded-schemas          (constantly #{"INFORMATION_SCHEMA"})
+    :quote-style               (constantly :hana)
     :string-length-fn          (u/drop-first-arg string-length-fn)
     ;; TODO - This can also be set via `sessionVariables` in the connection string, if that's more useful (?)
-    :set-timezone-sql          (constantly "SET @@session.time_zone = %s;")
+    :set-timezone-sql          (constantly "SET SESSION TIMEZONE = %s;")
     :unix-timestamp->timestamp (u/drop-first-arg unix-timestamp->timestamp)}))
 
 (defn -init-driver
